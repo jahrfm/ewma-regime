@@ -1,167 +1,154 @@
-import requests
-import math
+"""Long-only regime filter, evaluated on the bar after the label is known.
 
-def fetch_klines(symbol, interval, limit=200):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
-    response = requests.get(url, params=params)
-    data = response.json()
-    if data.get("retCode") != 0:
-        raise Exception(f"API error: {data}")
-    klines = data["result"]["list"]
-    klines = list(reversed(klines))
-    return klines
+Buy and hold is compounded on that same set of bars. Strategy hit rate counts
+only bars that were actually long. Turnover pays `fee_rate` of equity, and a
+position still open at the end pays the exit fee as well.
+"""
 
-def compute_ewma_regime(symbol, interval, limit=200, lambda_param=0.94, lookback=30,
-                        low_thresh=30, high_thresh=70):
-    klines = fetch_klines(symbol, interval, limit)
-    closes = [float(k[4]) for k in klines]
-    returns = []
-    for i in range(1, len(closes)):
-        ret = (closes[i] - closes[i-1]) / closes[i-1]
-        returns.append(ret)
-    if len(returns) == 0:
-        raise ValueError("No returns")
-    sigma2 = [returns[0]**2]
-    for i in range(1, len(returns)):
-        sigma2_t = lambda_param * sigma2[i-1] + (1 - lambda_param) * (returns[i]**2)
-        sigma2.append(sigma2_t)
-    sigma = [math.sqrt(v) for v in sigma2]
-    def percentile(lst, p):
-        if not lst:
-            return 0.0
-        sorted_lst = sorted(lst)
-        k = (len(sorted_lst) - 1) * p / 100.0
-        f = math.floor(k)
-        c = math.ceil(k)
-        if f == c:
-            return sorted_lst[int(k)]
-        d0 = sorted_lst[int(f)] * (c - k)
-        d1 = sorted_lst[int(c)] * (k - f)
-        return d0 + d1
-    labels = []
-    for i in range(len(sigma)):
-        if i < lookback:
-            labels.append(1)
-            continue
-        window = sigma[i-lookback:i]
-        current = sigma[i]
-        low_threshold = percentile(window, low_thresh)
-        high_threshold = percentile(window, high_thresh)
-        if current < low_threshold:
-            labels.append(0)
-        elif current > high_threshold:
-            labels.append(2)
-        else:
-            labels.append(1)
-    result = {
-        "symbol": symbol,
-        "interval": interval,
-        "timestamps": [k[0] for k in klines],
-        "closes": closes,
-        "returns": returns,
-        "sigma": sigma,
-        "labels": labels,
-        "lambda": lambda_param,
-        "lookback": lookback,
-        "low_thresh": low_thresh,
-        "high_thresh": high_thresh
-    }
-    return result
+from ewma_regime import annualized_sharpe, compute_ewma_regime, iter_forward_pairs
 
-def backtest_strategy(result, regime_filter):
+# Bybit linear USDT perpetual taker fee is about 5 bps per side.
+DEFAULT_FEE_RATE = 0.0005
+
+
+def backtest_strategy(result, regime_filter, fee_rate=DEFAULT_FEE_RATE, eval_start=None):
+    """Compounded performance of being long only when the prior label is allowed.
+
+    regime_filter lists allowed regimes, for example [0, 1] to be long in
+    Low or Medium and flat in High.
     """
-    regime_filter: list of allowed regimes for long positions
-    e.g., [0,1] = long in low/medium, flat in high
-          [0]   = long only in low
-          [1,2] = long in medium/high
-    Returns: total return, win rate, number of trades
-    """
-    returns = result["returns"]
-    labels = result["labels"]
-    
-    # We'll take a position at the close of period i based on label of return i-1?
-    # Actually, we have label for return i (which is from close i to i+1)
-    # Let's say we know the label at the open of period i (based on previous return)
-    # For simplicity, we'll align: position for return i is based on label i-1
-    # So we shift labels forward by 1, with first position being neutral
-    
-    if len(labels) != len(returns):
-        # This shouldn't happen with our implementation
-        raise ValueError("Labels and returns length mismatch")
-    
-    # Create position series: 1 = long, 0 = flat
-    # Position at time i is based on label at time i-1 (previous period's regime)
-    positions = [0] * len(returns)  # start flat
-    for i in range(1, len(labels)):
-        if labels[i-1] in regime_filter:
-            positions[i] = 1
-    
-    # Calculate strategy returns
-    strategy_returns = []
-    for pos, ret in zip(positions, returns):
-        strategy_returns.append(pos * ret)
-    
-    # Metrics
-    total_return = sum(strategy_returns)
-    # Compound return approximation (for small returns, sum is fine)
-    # Win rate
-    wins = sum(1 for r in strategy_returns if r > 0)
-    win_rate = wins / len(strategy_returns) if len(strategy_returns) > 0 else 0
-    # Number of trades (position changes)
-    trades = sum(1 for i in range(1, len(positions)) if positions[i] != positions[i-1])
-    
+    _validate_filter(regime_filter)
+    _validate_fee(fee_rate)
+    simple_returns = []
+    active_returns = []
+    prev_pos = 0
+    entries = 0
+    for _, label, forward in iter_forward_pairs(result, eval_start):
+        pos = 1 if label in regime_filter else 0
+        turnover = abs(pos - prev_pos)
+        if prev_pos == 0 and pos == 1:
+            entries += 1
+        simple_returns.append((1.0 - turnover * fee_rate) * (1.0 + pos * forward) - 1.0)
+        if pos == 1:
+            active_returns.append(forward)
+        prev_pos = pos
+    if prev_pos == 1 and fee_rate and simple_returns:
+        growth = 1.0 + simple_returns[-1]
+        simple_returns[-1] = growth * (1.0 - fee_rate) - 1.0
+    return _pack_metrics(simple_returns, active_returns, entries, result.get("interval"))
+
+
+def buy_and_hold(result, eval_start=None):
+    """Compounded price return on the same forward bars the strategy is scored on."""
+    forwards = [forward for _, _, forward in iter_forward_pairs(result, eval_start)]
+    return _pack_metrics(forwards, forwards, entries=0, interval=result.get("interval"))
+
+
+def print_strategy_results(symbol, interval, results_dict, fee_rate):
+    print(f"\n=== Strategy backtest: {symbol} {interval} ===")
+    print(
+        "Position on bar t uses the label from bar t - 1. "
+        f"Strategy figures are net of {fee_rate:.2%} per side, including an exit if still long. "
+        "Buy & hold is the raw price return on the same bars."
+    )
+    print(
+        f"{'Strategy':<16} {'Return':>10} {'Hit rate':>10} {'Exposure':>10} "
+        f"{'Trades':>8} {'Max DD':>10} {'Sharpe':>8} {'Bars':>6}"
+    )
+    for name, res in results_dict.items():
+        print(
+            f"{name:<16} {_format_pct(res['total_return']):>10} "
+            f"{_format_pct(res['hit_rate']):>10} {_format_pct(res['exposure']):>10} "
+            f"{res['trades']:>8} {_format_pct(res['max_drawdown']):>10} "
+            f"{_format_num(res['sharpe'], 8, '.2f')} {res['bars']:>6}"
+        )
+
+
+def _pack_metrics(simple_returns, active_returns, entries, interval):
+    bars = len(simple_returns)
+    if bars == 0:
+        return {
+            "total_return": None,
+            "hit_rate": None,
+            "exposure": None,
+            "trades": 0,
+            "max_drawdown": None,
+            "sharpe": None,
+            "bars": 0,
+            "simple_returns": [],
+        }
+    total_return, max_drawdown = _equity_path(simple_returns)
+    hit_rate = None
+    if active_returns:
+        hit_rate = sum(1 for value in active_returns if value > 0) / len(active_returns)
+    sharpe = None
+    if interval is not None:
+        sharpe = annualized_sharpe(simple_returns, interval)
     return {
         "total_return": total_return,
-        "win_rate": win_rate,
-        "trades": trades,
-        "strategy_returns": strategy_returns,
-        "positions": positions
+        "hit_rate": hit_rate,
+        "exposure": len(active_returns) / bars,
+        "trades": entries,
+        "max_drawdown": max_drawdown,
+        "sharpe": sharpe,
+        "bars": bars,
+        "simple_returns": simple_returns,
     }
 
-def print_strategy_results(symbol, interval, results_dict):
-    print(f"\n=== Strategy Backtest: {symbol} {interval} ===")
-    print(f"{'Strategy':<25} {'Total Return':<15} {'Win Rate':<12} {'Trades':<8}")
-    for name, res in results_dict.items():
-        print(f"{name:<25} {res['total_return']:<15.6f} {res['win_rate']:<12.2%} {res['trades']:<8}")
+
+def _equity_path(simple_returns):
+    equity = 1.0
+    peak = 1.0
+    max_drawdown = 0.0
+    for value in simple_returns:
+        equity *= 1.0 + value
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - equity) / peak)
+        if equity <= 0:
+            return -1.0, 1.0
+    return equity - 1.0, max_drawdown
+
+
+def _validate_filter(regime_filter):
+    if isinstance(regime_filter, (str, bytes)) or not regime_filter:
+        raise ValueError("regime_filter must be a non-empty collection of regimes 0, 1, and 2")
+    invalid = [label for label in regime_filter if label not in (0, 1, 2)]
+    if invalid:
+        raise ValueError(f"regime_filter contains {invalid}; allowed regimes are 0, 1, and 2")
+
+
+def _validate_fee(fee_rate):
+    if isinstance(fee_rate, bool) or not isinstance(fee_rate, (int, float)):
+        raise ValueError("fee_rate must be a number in [0, 1)")
+    if not 0 <= fee_rate < 1:
+        raise ValueError("fee_rate must be in [0, 1)")
+
+
+def _format_pct(value):
+    return "n/a" if value is None else f"{value:.2%}"
+
+
+def _format_num(value, width, spec):
+    if value is None:
+        return f"{'n/a':>{width}}"
+    return f"{value:>{width}{spec}}"
+
 
 if __name__ == "__main__":
     symbol = "BTCUSDT"
     interval = "15"
-    limit = 200
-    
-    result = compute_ewma_regime(symbol, interval, limit)
-    
-    # Test different strategies
+    result = compute_ewma_regime(symbol, interval, limit=1000)
     strategies = {
-        "Buy & Hold": None,  # special case
-        "Long Low/Med": [0,1],
+        "Long Low/Med": [0, 1],
         "Long Low Only": [0],
-        "Long Med/High": [1,2],
+        "Long Med/High": [1, 2],
         "Long High Only": [2],
-        "Reverse (Long High)": [2],  # same as above but we'll interpret differently
-        "Long Low/High": [0,2],
-        "Long Med Only": [1]
+        "Long Low/High": [0, 2],
+        "Long Med Only": [1],
     }
-    
-    results = {}
-    # Buy and hold
-    bh_return = sum(result["returns"])
-    results["Buy & Hold"] = {
-        "total_return": bh_return,
-        "win_rate": sum(1 for r in result["returns"] if r > 0) / len(result["returns"]),
-        "trades": 0  # no trades
-    }
-    
+    results = {"Buy & Hold": buy_and_hold(result)}
     for name, regime_filter in strategies.items():
-        if regime_filter is None:
-            continue  # already handled Buy & Hold
-        res = backtest_strategy(result, regime_filter)
-        results[name] = res
-    
-    print_strategy_results(symbol, interval, results)
+        results[name] = backtest_strategy(result, regime_filter)
+    print_strategy_results(symbol, interval, results, DEFAULT_FEE_RATE)

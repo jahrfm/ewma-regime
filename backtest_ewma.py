@@ -1,119 +1,77 @@
-import requests
-import math
+"""Forward-return profile of the EWMA regime label.
 
-def fetch_klines(symbol, interval, limit=200):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
-    response = requests.get(url, params=params)
-    data = response.json()
-    if data.get("retCode") != 0:
-        raise Exception(f"API error: {data}")
-    klines = data["result"]["list"]
-    klines = list(reversed(klines))
-    return klines
+The label on bar t - 1 is scored against the return of bar t. The return that
+entered the label is not the return being measured.
+"""
 
-def compute_ewma_regime(symbol, interval, limit=200, lambda_param=0.94, lookback=30,
-                        low_thresh=30, high_thresh=70):
-    klines = fetch_klines(symbol, interval, limit)
-    closes = [float(k[4]) for k in klines]
-    returns = []
-    for i in range(1, len(closes)):
-        ret = (closes[i] - closes[i-1]) / closes[i-1]
-        returns.append(ret)
-    if len(returns) == 0:
-        raise ValueError("No returns")
-    sigma2 = [returns[0]**2]
-    for i in range(1, len(returns)):
-        sigma2_t = lambda_param * sigma2[i-1] + (1 - lambda_param) * (returns[i]**2)
-        sigma2.append(sigma2_t)
-    sigma = [math.sqrt(v) for v in sigma2]
-    def percentile(lst, p):
-        if not lst:
-            return 0.0
-        sorted_lst = sorted(lst)
-        k = (len(sorted_lst) - 1) * p / 100.0
-        f = math.floor(k)
-        c = math.ceil(k)
-        if f == c:
-            return sorted_lst[int(k)]
-        d0 = sorted_lst[int(f)] * (c - k)
-        d1 = sorted_lst[int(c)] * (k - f)
-        return d0 + d1
-    labels = []
-    for i in range(len(sigma)):
-        if i < lookback:
-            labels.append(1)
-            continue
-        window = sigma[i-lookback:i]
-        current = sigma[i]
-        low_threshold = percentile(window, low_thresh)
-        high_threshold = percentile(window, high_thresh)
-        if current < low_threshold:
-            labels.append(0)
-        elif current > high_threshold:
-            labels.append(2)
-        else:
-            labels.append(1)
-    # Align: labels length = len(returns)
-    result = {
-        "symbol": symbol,
-        "interval": interval,
-        "timestamps": [k[0] for k in klines],
-        "closes": closes,
-        "returns": returns,
-        "sigma": sigma,
-        "labels": labels,
-        "lambda": lambda_param,
-        "lookback": lookback,
-        "low_thresh": low_thresh,
-        "high_thresh": high_thresh
-    }
-    return result
+from ewma_regime import (
+    annualized_sharpe,
+    compute_ewma_regime,
+    iter_forward_pairs,
+    mean_and_std,
+)
 
-def backtest_regime(result):
-    returns = result["returns"]
-    labels = result["labels"]
-    # Group returns by label
-    ret_by_label = {0: [], 1: [], 2: []}
-    for r, l in zip(returns, labels):
-        ret_by_label[l].append(r)
-    stats = {}
-    for l in [0,1,2]:
-        lst = ret_by_label[l]
-        if len(lst) == 0:
-            stats[l] = {"count":0, "mean":0.0, "std":0.0, "sharpe":0.0, "hit_rate":0.0}
-            continue
-        mean = sum(lst)/len(lst)
-        variance = sum((x-mean)**2 for x in lst)/len(lst)
-        std = math.sqrt(variance) if variance>0 else 0.0
-        sharpe = mean/std if std>0 else 0.0
-        hit = sum(1 for x in lst if x>0)/len(lst)
-        stats[l] = {"count":len(lst), "mean":mean, "std":std, "sharpe":sharpe, "hit_rate":hit}
-    return stats, ret_by_label
+REGIMES = {0: "Low", 1: "Medium", 2: "High"}
+
+
+def forward_regime_stats(result, eval_start=None):
+    """Next-bar return distribution conditional on the already-known label."""
+    grouped = {0: [], 1: [], 2: []}
+    paired = []
+    for _, label, forward in iter_forward_pairs(result, eval_start):
+        grouped[label].append(forward)
+        paired.append(forward)
+    stats = {label: _summarize(grouped[label], result.get("interval")) for label in REGIMES}
+    stats["all"] = _summarize(paired, result.get("interval"))
+    return stats
+
 
 def print_backtest(symbol, interval, stats):
-    print(f"\n=== Backtest EWMA Regime: {symbol} {interval} ===")
-    print(f"{'Regime':<8} {'Count':<8} {'Mean Ret':<12} {'Std':<12} {'Sharpe':<10} {'Hit Rate':<10}")
-    for l in [0,1,2]:
-        s = stats[l]
-        label_name = {0:"Low",1:"Medium",2:"High"}[l]
-        print(f"{label_name:<8} {s['count']:<8} {s['mean']:<12.6f} {s['std']:<12.6f} {s['sharpe']:<10.4f} {s['hit_rate']:<10.2%}")
+    print(f"\n=== Forward EWMA regime test: {symbol} {interval} ===")
+    print("Each row is the return of the bar after the label was known. Warmup bars are excluded.")
+    print(
+        f"{'Regime':<8} {'Bars':>6} {'Mean':>12} {'Std':>12} "
+        f"{'Hit rate':>10} {'Ann. Sharpe':>12}"
+    )
+    order = [("all", "All")] + [(label, REGIMES[label]) for label in (0, 1, 2)]
+    for key, name in order:
+        row = stats[key]
+        print(
+            f"{name:<8} {row['count']:>6} {_format_num(row['mean'], 12, '.6f')} "
+            f"{_format_num(row['std'], 12, '.6f')} {_format_pct(row['hit_rate']):>10} "
+            f"{_format_num(row['sharpe'], 12, '.3f')}"
+        )
+
+
+def _summarize(values, interval):
+    mean, std = mean_and_std(values)
+    hit_rate = None
+    if values:
+        hit_rate = sum(1 for value in values if value > 0) / len(values)
+    sharpe = None
+    if interval is not None and len(values) >= 2:
+        sharpe = annualized_sharpe(values, interval)
+    return {
+        "count": len(values),
+        "mean": mean,
+        "std": std,
+        "hit_rate": hit_rate,
+        "sharpe": sharpe,
+    }
+
+
+def _format_num(value, width, spec):
+    if value is None:
+        return f"{'n/a':>{width}}"
+    return f"{value:>{width}{spec}}"
+
+
+def _format_pct(value):
+    return "n/a" if value is None else f"{value:.2%}"
+
 
 if __name__ == "__main__":
-    # Test BTCUSDT 15m
-    result = compute_ewma_regime("BTCUSDT", "15", limit=200)
-    stats, _ = backtest_regime(result)
-    print_backtest("BTCUSDT", "15", stats)
-    # Also test ETHUSDT 15m
-    result2 = compute_ewma_regime("ETHUSDT", "15", limit=200)
-    stats2, _ = backtest_regime(result2)
-    print_backtest("ETHUSDT", "15", stats2)
-    # Test BTCUSDT 1h
-    result3 = compute_ewma_regime("BTCUSDT", "60", limit=200)
-    stats3, _ = backtest_regime(result3)
-    print_backtest("BTCUSDT", "60", stats3)
+    samples = [("BTCUSDT", "15"), ("ETHUSDT", "15"), ("BTCUSDT", "60")]
+    for symbol, interval in samples:
+        result = compute_ewma_regime(symbol, interval, limit=1000)
+        print_backtest(symbol, interval, forward_regime_stats(result))
